@@ -433,7 +433,7 @@ class LlamaFlashAttention_KIVI(LlamaAttention_KIVI):
 
         else:
             # print(f"kivi with flash! {self.k_bits}")
-            residual_length = self.config.residual_length if self.config.quantize_decoding_only == "false" else 1000000
+            residual_length = self.config.residual_length
             input_dtype = query_states.dtype
             if input_dtype == torch.float32:
                 # Handle the case where the model is quantized
@@ -506,14 +506,8 @@ class LlamaFlashAttention_KIVI(LlamaAttention_KIVI):
                                                                                                 self.group_size, 
                                                                                                 self.v_bits)
 
-            if self.config.quantize_decoding_only == "true":
-                key_states_pre = key_states_full
-                value_states_pre = value_states_full
-                key_states_full = None
-                value_states_full = None  # TODO: no need to set None, value_states can be quantized regardless of padding
-            else:
-                key_states_pre = None
-                value_states_pre = None
+            key_states_pre = None
+            value_states_pre = None
 
         past_key_value = (key_states_quant_trans, key_states_full, key_scale_trans, key_mn_trans, 
                           value_states_quant, value_states_full, value_scale, value_mn, key_states_pre, value_states_pre, kv_seq_len) if use_cache else None
