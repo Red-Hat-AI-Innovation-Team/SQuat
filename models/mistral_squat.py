@@ -21,7 +21,7 @@
 import inspect
 import math
 import warnings
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union, Any, Dict, Callable
 
 import torch
 import torch.nn.functional as F
@@ -32,11 +32,22 @@ from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 from quant.new_pack import triton_quantize_and_pack_along_last_dim, unpack_and_dequant_along_last_dim, squat_lagrangian, generate_At_inv
 from quant.matmul import cuda_bmm_fA_qB_outer, cuda_bmm_fA_qB_outer_cos_sin, cuda_bmm_fA_qB_outer_rope
 
-
 from transformers.models.mistral.configuration_mistral import *
 from transformers.models.mistral.modeling_mistral import *
 from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask
 
+from transformers.generation.utils import (
+    GenerationConfig,
+    LogitsProcessorList,
+    StoppingCriteriaList,
+    GenerationMode,
+    GenerateOutput,
+)
+from transformers.generation.streamers import BaseStreamer
+from transformers.modeling_outputs import CausalLMOutputWithPast
+from transformers.utils import ModelOutput
+from transformers.cache_utils import DynamicCache, EncoderDecoderCache
+import inspect
 
 _CONFIG_FOR_DOC = "MistralConfig"
 
@@ -293,6 +304,9 @@ class MistralFlashAttention_SQuat_postrope(nn.Module):
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
+        use_aux_states: bool = False,
+        save_aux_states: bool = False,
+        aux_states = None,
         **kwargs,
     ):
         if "padding_mask" in kwargs:
@@ -357,10 +371,6 @@ class MistralFlashAttention_SQuat_postrope(nn.Module):
             else:
                 att_qkpre = None
 
-
-
-            # import ipdb; ipdb.set_trace()
-
             if key_states_quant_trans is not None:
                 key_states_quant_trans_repeat = repeat_kv_quant(key_states_quant_trans, self.num_key_value_groups)
                 key_scale_trans_repeat = repeat_kv_quant(key_scale_trans, self.num_key_value_groups)
@@ -377,15 +387,10 @@ class MistralFlashAttention_SQuat_postrope(nn.Module):
             key_states_full_repeat = repeat_kv(key_states_full, self.num_key_value_groups)
             att_qkfull = torch.matmul(query_states, key_states_full_repeat.transpose(2, 3))
 
-
-            ### WHY adding this?
             if att_qkpre is not None:
                 attn_weights = att_qkpre
             else:
                 attn_weights = torch.zeros((bsz, self.num_heads, q_len, 0), device=query_states.device)
-
-
-
 
             if att_qkquant is not None:
                 attn_weights = torch.cat([attn_weights, att_qkquant], dim=-1)
@@ -458,9 +463,7 @@ class MistralFlashAttention_SQuat_postrope(nn.Module):
                     value_scale = scale
                     value_mn = mn
 
-
         else:
-
             key_states_repeat = repeat_kv(key_states, self.num_key_value_groups)
             value_states_repeat = repeat_kv(value_states, self.num_key_value_groups)
 
@@ -487,56 +490,66 @@ class MistralFlashAttention_SQuat_postrope(nn.Module):
                 query_states, key_states, 
                 value_states, attention_mask, q_len, dropout=0.0
             )
-            kv_nh = key_states.shape[1]
-            head_dim = query_states.shape[3]
-            subspace_dim = min(self.config.subspace_dim, self.num_key_value_groups*key_states.shape[2])
 
-
-
-
-            # Get valid tokens from attention mask
-            if attention_mask is not None:
-                # Get last row of attention mask [bs, 1, seq_len]
-                last_row_mask = attention_mask[:, :, -1, :]
-                # Find valid token positions (where mask is 0)
-                valid_tokens = (last_row_mask == 0).squeeze(1)  # [bs, seq_len]
-                
-                # Only keep valid tokens for each batch
-                query_subspace = []
-                for b in range(bsz):
-                    # Get valid tokens for this batch
-                    batch_valid = valid_tokens[b]  # [seq_len]
-                    # Select valid tokens from query states
-                    batch_query = query_states[b]  # [kv_nh, seq_len, head_dim] 
-                    batch_valid_query = batch_query[:, batch_valid, :]  # [kv_nh, valid_len, head_dim]
-
-                    valid_query_states_matrix = batch_valid_query.reshape(kv_nh, -1, head_dim)
-                    U, S, Vh = torch.linalg.svd(valid_query_states_matrix.float(), full_matrices=False)
-                    S_subspace = torch.diag_embed(S[:, :subspace_dim]).to(valid_query_states_matrix.dtype)
-                    Vh_subspace = Vh[:, :subspace_dim, :].to(valid_query_states_matrix.dtype)
-                    batch_query_subspace = torch.matmul(S_subspace, Vh_subspace)
-                    query_subspace.append(batch_query_subspace)
-                    if self.config.shared_svd == 'true':
-                        break
-                
-                # Stack back into tensor
-                query_subspace = torch.stack(query_subspace)  # [bs, kv_nh, valid_len, head_dim]
+            if use_aux_states:
+                layer_idx = kwargs['layer_idx']
+                Ainv_t = aux_states[layer_idx]['Ainv_t']
+                P_inv = aux_states[layer_idx]['P_inv']
             else:
-                query_states_matrix = query_states.reshape(bsz, kv_nh, -1, head_dim)
-                U, S, Vh = torch.linalg.svd(query_states_matrix.float(), full_matrices=False)  #!!! float here might be suboptimal
-                S_subspace = torch.diag_embed(S[:, :, :subspace_dim]).to(query_states_matrix.dtype)
-                Vh_subspace = Vh[:, :, :subspace_dim, :].to(query_states_matrix.dtype)
+                kv_nh = key_states.shape[1]
+                head_dim = query_states.shape[3]
+                subspace_dim = min(self.config.subspace_dim, self.num_key_value_groups*key_states.shape[2])
 
-                # dimension: [bs, nh, subspace_dim, head_dim]
-                query_subspace = torch.matmul(S_subspace, Vh_subspace)
+                # Get valid tokens from attention mask
+                if attention_mask is not None:
+                    # Get last row of attention mask [bs, 1, seq_len]
+                    last_row_mask = attention_mask[:, :, -1, :]
+                    # Find valid token positions (where mask is 0)
+                    valid_tokens = (last_row_mask == 0).squeeze(1)  # [bs, seq_len]
+                    
+                    # Only keep valid tokens for each batch
+                    query_subspace = []
+                    for b in range(bsz):
+                        # Get valid tokens for this batch
+                        batch_valid = valid_tokens[b]  # [seq_len]
+                        # Select valid tokens from query states
+                        batch_query = query_states[b]  # [kv_nh, seq_len, head_dim] 
+                        batch_valid_query = batch_query[:, batch_valid, :]  # [kv_nh, valid_len, head_dim]
 
-            if self.config.shared_svd == 'true':
-                query_subspace = query_subspace[0:1, ...]
+                        valid_query_states_matrix = batch_valid_query.reshape(kv_nh, -1, head_dim)
+                        U, S, Vh = torch.linalg.svd(valid_query_states_matrix.float(), full_matrices=False)
+                        S_subspace = torch.diag_embed(S[:, :subspace_dim]).to(valid_query_states_matrix.dtype)
+                        Vh_subspace = Vh[:, :subspace_dim, :].to(valid_query_states_matrix.dtype)
+                        batch_query_subspace = torch.matmul(S_subspace, Vh_subspace)
+                        query_subspace.append(batch_query_subspace)
+                        if self.config.shared_svd == 'true':
+                            break
+                    
+                    # Stack back into tensor
+                    query_subspace = torch.stack(query_subspace)  # [bs, kv_nh, valid_len, head_dim]
+                else:
+                    query_states_matrix = query_states.reshape(bsz, kv_nh, -1, head_dim)
+                    U, S, Vh = torch.linalg.svd(query_states_matrix.float(), full_matrices=False)  #!!! float here might be suboptimal
+                    S_subspace = torch.diag_embed(S[:, :, :subspace_dim]).to(query_states_matrix.dtype)
+                    Vh_subspace = Vh[:, :, :subspace_dim, :].to(query_states_matrix.dtype)
 
-            # !!!! do not need to convert query_subspace to float?
-            # Ainv_t is a list of  matrices
-            Ainv_t = generate_At_inv(self.config.quant_group_size, query_subspace.float(), lamb = self.config.squat_lambda)
-            P_inv = torch.inverse(Ainv_t[-1])
+                    # dimension: [bs, nh, subspace_dim, head_dim]
+                    query_subspace = torch.matmul(S_subspace, Vh_subspace)
+
+                if self.config.shared_svd == 'true':
+                    query_subspace = query_subspace[0:1, ...]
+
+                # !!!! do not need to convert query_subspace to float?
+                # Ainv_t is a list of  matrices
+                Ainv_t = generate_At_inv(self.config.quant_group_size, query_subspace.float(), lamb = self.config.squat_lambda)
+                P_inv = torch.inverse(Ainv_t[-1])
+
+                if save_aux_states:
+                    layer_idx = kwargs['layer_idx']
+                    aux_states[layer_idx] = {
+                        'Ainv_t': Ainv_t,
+                        'P_inv': P_inv,
+                    }
 
             # quantize
             if key_states.shape[-2] % self.residual_length != 0:
@@ -549,7 +562,6 @@ class MistralFlashAttention_SQuat_postrope(nn.Module):
             else:
                 key_states_quant = key_states
                 key_states_full = None
-
 
             if key_states_quant is not None:
                 key_states_quant_trans, key_scale_trans, key_mn_trans = triton_quantize_and_pack_along_last_dim(key_states_quant.transpose(2, 3).contiguous(), self.group_size, self.k_bits)
@@ -564,7 +576,6 @@ class MistralFlashAttention_SQuat_postrope(nn.Module):
                     key_states_quant_fixed = key_states_quant
                 key_states_quant_trans, key_scale_trans, key_mn_trans = squat_lagrangian(key_states_quant_fixed.transpose(2, 3).contiguous(), self.config.quant_group_size, self.group_size, self.k_bits, Ainv_t, P_inv)
                 
-            
             else:
                 key_states_quant_trans = None
                 key_scale_trans = None
@@ -748,6 +759,9 @@ class MistralFlashAttention_SQuat(MistralFlashAttention_SQuat_postrope):
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
+        use_aux_states: bool = False,
+        save_aux_states: bool = False,
+        aux_states: Optional[Dict[str, Any]] = None,
         **kwargs,
     ):
         if "padding_mask" in kwargs:
@@ -938,54 +952,67 @@ class MistralFlashAttention_SQuat(MistralFlashAttention_SQuat_postrope):
                 query_states_rot, key_states_rot, 
                 value_states, attention_mask, q_len, dropout=0.0
             )
-            kv_nh = key_states.shape[1]
-            head_dim = query_states.shape[3]
-            subspace_dim = min(self.config.subspace_dim, self.num_key_value_groups*key_states.shape[2])
 
-            # Get valid tokens from attention mask
-            if attention_mask is not None:
-                # Get last row of attention mask [bs, 1, seq_len]
-                last_row_mask = attention_mask[:, :, -1, :]
-                # Find valid token positions (where mask is 0)
-                valid_tokens = (last_row_mask == 0).squeeze(1)  # [bs, seq_len]
-                
-                # Only keep valid tokens for each batch
-                query_subspace = []
-                for b in range(bsz):
-                    # Get valid tokens for this batch
-                    batch_valid = valid_tokens[b]  # [seq_len]
-                    # Select valid tokens from query states
-                    batch_query = query_states[b]  # [kv_nh, seq_len, head_dim] 
-                    batch_valid_query = batch_query[:, batch_valid, :]  # [kv_nh, valid_len, head_dim]
-
-                    valid_query_states_matrix = batch_valid_query.reshape(kv_nh, -1, head_dim)
-                    U, S, Vh = torch.linalg.svd(valid_query_states_matrix.float(), full_matrices=False)
-                    S_subspace = torch.diag_embed(S[:, :subspace_dim]).to(valid_query_states_matrix.dtype)
-                    Vh_subspace = Vh[:, :subspace_dim, :].to(valid_query_states_matrix.dtype)
-                    batch_query_subspace = torch.matmul(S_subspace, Vh_subspace)
-                    query_subspace.append(batch_query_subspace)
-                    if self.config.shared_svd == 'true':
-                        break
-                
-                # Stack back into tensor
-                query_subspace = torch.stack(query_subspace)  # [bs, kv_nh, valid_len, head_dim]
+            if use_aux_states:
+                layer_idx = kwargs['layer_idx']
+                Ainv_t = aux_states[layer_idx]['Ainv_t']
+                P_inv = aux_states[layer_idx]['P_inv']
             else:
-                query_states_matrix = query_states.reshape(bsz, kv_nh, -1, head_dim)
+                kv_nh = key_states.shape[1]
+                head_dim = query_states.shape[3]
+                subspace_dim = min(self.config.subspace_dim, self.num_key_value_groups*key_states.shape[2])
 
-                U, S, Vh = torch.linalg.svd(query_states_matrix.float(), full_matrices=False)  #!!! float here might be suboptimal
-                S_subspace = torch.diag_embed(S[:, :, :subspace_dim]).to(query_states_matrix.dtype)
-                Vh_subspace = Vh[:, :, :subspace_dim, :].to(query_states_matrix.dtype)
+                # Get valid tokens from attention mask
+                if attention_mask is not None:
+                    # Get last row of attention mask [bs, 1, seq_len]
+                    last_row_mask = attention_mask[:, :, -1, :]
+                    # Find valid token positions (where mask is 0)
+                    valid_tokens = (last_row_mask == 0).squeeze(1)  # [bs, seq_len]
+                    
+                    # Only keep valid tokens for each batch
+                    query_subspace = []
+                    for b in range(bsz):
+                        # Get valid tokens for this batch
+                        batch_valid = valid_tokens[b]  # [seq_len]
+                        # Select valid tokens from query states
+                        batch_query = query_states[b]  # [kv_nh, seq_len, head_dim] 
+                        batch_valid_query = batch_query[:, batch_valid, :]  # [kv_nh, valid_len, head_dim]
 
-                # dimension: [bs, nh, subspace_dim, head_dim]
-                query_subspace = torch.matmul(S_subspace, Vh_subspace)
+                        valid_query_states_matrix = batch_valid_query.reshape(kv_nh, -1, head_dim)
+                        U, S, Vh = torch.linalg.svd(valid_query_states_matrix.float(), full_matrices=False)
+                        S_subspace = torch.diag_embed(S[:, :subspace_dim]).to(valid_query_states_matrix.dtype)
+                        Vh_subspace = Vh[:, :subspace_dim, :].to(valid_query_states_matrix.dtype)
+                        batch_query_subspace = torch.matmul(S_subspace, Vh_subspace)
+                        query_subspace.append(batch_query_subspace)
+                        if self.config.shared_svd == 'true':
+                            break
+                    
+                    # Stack back into tensor
+                    query_subspace = torch.stack(query_subspace)  # [bs, kv_nh, valid_len, head_dim]
+                else:
+                    query_states_matrix = query_states.reshape(bsz, kv_nh, -1, head_dim)
 
-            if self.config.shared_svd == 'true':
-                query_subspace = query_subspace[0:1, ...]
+                    U, S, Vh = torch.linalg.svd(query_states_matrix.float(), full_matrices=False)  #!!! float here might be suboptimal
+                    S_subspace = torch.diag_embed(S[:, :, :subspace_dim]).to(query_states_matrix.dtype)
+                    Vh_subspace = Vh[:, :, :subspace_dim, :].to(query_states_matrix.dtype)
 
-            # !!!! do not need to convert query_subspace to float?
-            # Ainv_t is a list of  matrices
-            Ainv_t = generate_At_inv(self.config.quant_group_size, query_subspace.float(), lamb = self.config.squat_lambda)
-            P_inv = torch.inverse(Ainv_t[-1])
+                    # dimension: [bs, nh, subspace_dim, head_dim]
+                    query_subspace = torch.matmul(S_subspace, Vh_subspace)
+
+                if self.config.shared_svd == 'true':
+                    query_subspace = query_subspace[0:1, ...]
+
+                # !!!! do not need to convert query_subspace to float?
+                # Ainv_t is a list of  matrices
+                Ainv_t = generate_At_inv(self.config.quant_group_size, query_subspace.float(), lamb = self.config.squat_lambda)
+                P_inv = torch.inverse(Ainv_t[-1])
+
+                if save_aux_states:
+                    layer_idx = kwargs['layer_idx']
+                    aux_states[layer_idx] = {
+                        'Ainv_t': Ainv_t,
+                        'P_inv': P_inv,
+                    }
 
             # quantize
             if key_states.shape[-2] % self.residual_length != 0:
@@ -1165,6 +1192,7 @@ class MistralModel_SQuat(MistralPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        **kwargs,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -1270,6 +1298,8 @@ class MistralModel_SQuat(MistralPreTrainedModel):
                     past_key_value=past_key_value,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
+                    layer_idx=idx,
+                    **kwargs,
                 )
 
             hidden_states = layer_outputs[0]
@@ -1341,6 +1371,7 @@ class MistralForCausalLM_SQuat(MistralPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        **kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
         Args:
@@ -1385,6 +1416,7 @@ class MistralForCausalLM_SQuat(MistralPreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            **kwargs,
         )
 
         hidden_states = outputs[0]
@@ -1460,6 +1492,9 @@ class MistralForCausalLM_SQuat(MistralPreTrainedModel):
                 "attention_mask": attention_mask,
             }
         )
+        if 'aux_states' in kwargs:
+            model_inputs['use_aux_states'] = True
+            model_inputs['aux_states'] = kwargs['aux_states']
         return model_inputs
 
     @staticmethod
@@ -1470,3 +1505,330 @@ class MistralForCausalLM_SQuat(MistralPreTrainedModel):
                 tuple(past_state.index_select(0, beam_idx.to(past_state.device)) for past_state in layer_past),
             )
         return reordered_past
+    
+    def _validate_model_kwargs(self, model_kwargs: Dict[str, Any]) -> None:
+        """Override the validation to allow our custom kwargs"""
+        # Remove our custom kwargs before validation
+        use_aux_states = model_kwargs.pop("use_aux_states", None)
+        save_aux_states = model_kwargs.pop("save_aux_states", None)
+        aux_states = model_kwargs.pop("aux_states", None)
+        
+        # Call parent validation for remaining kwargs
+        super()._validate_model_kwargs(model_kwargs)
+        
+        # Put our kwargs back
+        if save_aux_states is not None:
+            model_kwargs["save_aux_states"] = save_aux_states
+        if use_aux_states is not None:
+            model_kwargs["use_aux_states"] = use_aux_states
+        if aux_states is not None:
+            model_kwargs["aux_states"] = aux_states
+
+    def save_auxiliary_states(
+        self,
+        inputs: Optional[torch.Tensor] = None,
+        save_aux_states: bool = True,
+        use_aux_states: bool = False,
+        aux_states = None,
+        **kwargs,
+    ) -> Union[GenerateOutput, torch.LongTensor]:
+        generation_config, model_kwargs = self._prepare_generation_config(None, **kwargs)
+
+        accepts_attention_mask = "attention_mask" in set(inspect.signature(self.forward).parameters.keys())
+        requires_attention_mask = "encoder_outputs" not in model_kwargs
+        kwargs_has_attention_mask = model_kwargs.get("attention_mask", None) is not None
+
+        inputs_tensor, model_input_name, model_kwargs = self._prepare_model_inputs(
+            inputs, generation_config.bos_token_id, model_kwargs
+        )
+
+        device = inputs_tensor.device
+        self._prepare_special_tokens(generation_config, kwargs_has_attention_mask, device=device)
+
+        if not self.config.is_encoder_decoder and model_input_name == "inputs_embeds":
+            model_kwargs["use_cache"] = True
+        else:
+            model_kwargs["use_cache"] = generation_config.use_cache
+
+        if not kwargs_has_attention_mask and requires_attention_mask and accepts_attention_mask:
+            model_kwargs["attention_mask"] = self._prepare_attention_mask_for_generation(
+                inputs_tensor, generation_config._pad_token_tensor, generation_config._eos_token_tensor
+            )
+
+        input_ids = inputs_tensor if model_input_name == "input_ids" else model_kwargs.pop("input_ids")
+
+        if "mamba" in self.__class__.__name__.lower():
+            cache_name = "cache_params"
+        else:
+            cache_name = "past_key_values"
+
+        # Use DynamicCache() instance by default. This will avoid back and forth from legacy format that
+        # keeps copying the cache thus using much more memory
+
+        past = model_kwargs.get(cache_name, None)
+        requires_cross_attention_cache = (
+            self.config.is_encoder_decoder or model_kwargs.get("encoder_outputs") is not None
+        )
+        if past is None:
+            model_kwargs[cache_name] = (
+                DynamicCache()
+                if not requires_cross_attention_cache
+                else EncoderDecoderCache(DynamicCache(), DynamicCache())
+            )
+
+        input_ids, model_kwargs = self._expand_inputs_for_generation(
+            input_ids=input_ids,
+            expand_size=generation_config.num_return_sequences,
+            is_encoder_decoder=self.config.is_encoder_decoder,
+            **model_kwargs,
+        )
+
+        model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
+        outputs = self(**model_inputs, 
+                       aux_states=aux_states, 
+                       save_aux_states=save_aux_states,
+                       use_aux_states=use_aux_states,
+                       return_dict=True)
+        return outputs
+
+    @torch.no_grad()
+    def generate2(
+        self,
+        inputs: Optional[torch.Tensor] = None,
+        generation_config: Optional[GenerationConfig] = None,
+        logits_processor: Optional[LogitsProcessorList] = None,
+        stopping_criteria: Optional[StoppingCriteriaList] = None,
+        prefix_allowed_tokens_fn: Optional[Callable[[int, torch.Tensor], List[int]]] = None,
+        synced_gpus: Optional[bool] = None,
+        assistant_model: Optional["PreTrainedModel"] = None,
+        streamer: Optional["BaseStreamer"] = None,
+        negative_prompt_ids: Optional[torch.Tensor] = None,
+        negative_prompt_attention_mask: Optional[torch.Tensor] = None,
+        use_aux_states: bool = True,
+        aux_states: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> Union[GenerateOutput, torch.LongTensor]:
+        if aux_states is not None:
+            print(f"<< Generating with auxiliary states >>")
+
+        # 1. Handle `generation_config` and kwargs that might update it, and validate the `.generate()` call
+        self._validate_model_class()
+        tokenizer = kwargs.pop("tokenizer", None)  # Pull this out first, we only use it for stopping criteria
+        generation_config, model_kwargs = self._prepare_generation_config(generation_config, **kwargs)
+        # self._validate_model_kwargs(model_kwargs.copy())
+        self._validate_assistant(assistant_model)
+
+        logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList()
+        stopping_criteria = stopping_criteria if stopping_criteria is not None else StoppingCriteriaList()
+
+        accepts_attention_mask = "attention_mask" in set(inspect.signature(self.forward).parameters.keys())
+        requires_attention_mask = "encoder_outputs" not in model_kwargs
+        kwargs_has_attention_mask = model_kwargs.get("attention_mask", None) is not None
+
+        # 3. Define model inputs
+        inputs_tensor, model_input_name, model_kwargs = self._prepare_model_inputs(
+            inputs, generation_config.bos_token_id, model_kwargs
+        )
+        batch_size = inputs_tensor.shape[0]
+
+        device = inputs_tensor.device
+        self._prepare_special_tokens(generation_config, kwargs_has_attention_mask, device=device)
+
+        # 4. Define other model kwargs
+        # decoder-only models with inputs_embeds forwarding must use caching (otherwise we can't detect whether we are
+        # generating the first new token or not, and we only want to use the embeddings for the first new token)
+        if not self.config.is_encoder_decoder and model_input_name == "inputs_embeds":
+            model_kwargs["use_cache"] = True
+        else:
+            model_kwargs["use_cache"] = generation_config.use_cache
+
+        if not kwargs_has_attention_mask and requires_attention_mask and accepts_attention_mask:
+            model_kwargs["attention_mask"] = self._prepare_attention_mask_for_generation(
+                inputs_tensor, generation_config._pad_token_tensor, generation_config._eos_token_tensor
+            )
+
+        if self.config.is_encoder_decoder and "encoder_outputs" not in model_kwargs:
+            # if model is encoder decoder encoder_outputs are created and added to `model_kwargs`
+            model_kwargs = self._prepare_encoder_decoder_kwargs_for_generation(
+                inputs_tensor, model_kwargs, model_input_name, generation_config
+            )
+
+        # 5. Prepare `input_ids` which will be used for auto-regressive generation
+        if self.config.is_encoder_decoder:
+            input_ids, model_kwargs = self._prepare_decoder_input_ids_for_generation(
+                batch_size=batch_size,
+                model_input_name=model_input_name,
+                model_kwargs=model_kwargs,
+                decoder_start_token_id=generation_config._decoder_start_token_tensor,
+                device=inputs_tensor.device,
+            )
+        else:
+            input_ids = inputs_tensor if model_input_name == "input_ids" else model_kwargs.pop("input_ids")
+
+        if generation_config.token_healing:
+            input_ids = self.heal_tokens(input_ids, tokenizer)
+
+        if streamer is not None:
+            streamer.put(input_ids.cpu())
+
+        # 6. Prepare `max_length` depending on other stopping criteria.
+        input_ids_length = input_ids.shape[-1]
+        has_default_max_length = kwargs.get("max_length") is None and generation_config.max_length is not None
+        has_default_min_length = kwargs.get("min_length") is None and generation_config.min_length is not None
+        generation_config = self._prepare_generated_length(
+            generation_config=generation_config,
+            has_default_max_length=has_default_max_length,
+            has_default_min_length=has_default_min_length,
+            model_input_name=model_input_name,
+            inputs_tensor=inputs_tensor,
+            input_ids_length=input_ids_length,
+        )
+
+        use_dynamic_cache_by_default = False
+        if "mamba" in self.__class__.__name__.lower():
+            cache_name = "cache_params"
+        else:
+            cache_name = "past_key_values"
+
+        if generation_config.cache_implementation is not None and (model_kwargs.get(cache_name) is not None):
+            raise ValueError(
+                f"Passing both `cache_implementation` (used to initialize certain caches) and `{cache_name}` (a "
+                "Cache object) is unsupported. Please use only one of the two."
+            )
+        elif generation_config.cache_implementation is not None:
+            if generation_config.cache_implementation in NEED_SETUP_CACHE_CLASSES_MAPPING:
+                if generation_config.cache_implementation == "static" and not self._supports_static_cache:
+                    raise ValueError(
+                        "This model does not support `cache_implementation='static'`. Please check the following "
+                        "issue: https://github.com/huggingface/transformers/issues/28981"
+                    )
+                model_kwargs[cache_name] = self._get_cache(
+                    generation_config.cache_implementation,
+                    getattr(generation_config, "num_beams", 1) * batch_size,
+                    generation_config.max_length,
+                    model_kwargs,
+                )
+            elif generation_config.cache_implementation == "quantized":
+                if not self._supports_quantized_cache:
+                    raise ValueError(
+                        "This model does not support the quantized cache. If you want your model to support quantized "
+                        "cache, please open an issue."
+                    )
+
+                cache_config = (
+                    generation_config.cache_config
+                    if generation_config.cache_config is not None
+                    else QuantizedCacheConfig()
+                )
+                cache_class = QUANT_BACKEND_CLASSES_MAPPING[cache_config.backend]
+
+                if cache_config.backend == "quanto" and not is_quanto_available():
+                    raise ImportError(
+                        "You need to install `quanto` in order to use KV cache quantization with quanto backend. "
+                        "Please install it via  with `pip install quanto`"
+                    )
+                elif cache_config.backend == "HQQ" and not is_hqq_available():
+                    raise ImportError(
+                        "You need to install `HQQ` in order to use KV cache quantization with HQQ backend. "
+                        "Please install it via  with `pip install hqq`"
+                    )
+
+                model_kwargs[cache_name] = cache_class(cache_config)
+        # Use DynamicCache() instance by default. This will avoid back and forth from legacy format that
+        # keeps copying the cache thus using much more memory
+        elif generation_config.cache_implementation is None and self._supports_default_dynamic_cache():
+            past = model_kwargs.get(cache_name, None)
+            requires_cross_attention_cache = (
+                self.config.is_encoder_decoder or model_kwargs.get("encoder_outputs") is not None
+            )
+            if past is None:
+                model_kwargs[cache_name] = (
+                    DynamicCache()
+                    if not requires_cross_attention_cache
+                    else EncoderDecoderCache(DynamicCache(), DynamicCache())
+                )
+                use_dynamic_cache_by_default = True
+            elif isinstance(past, tuple):
+                model_kwargs[cache_name] = (
+                    DynamicCache.from_legacy_cache(past)
+                    if not requires_cross_attention_cache
+                    else EncoderDecoderCache.from_legacy_cache(past)
+                )
+                use_dynamic_cache_by_default = True
+
+        self._validate_generated_length(generation_config, input_ids_length, has_default_max_length)
+
+        # 7. determine generation mode
+        generation_mode = generation_config.get_generation_mode(assistant_model)
+
+        if streamer is not None and (generation_config.num_beams > 1):
+            raise ValueError(
+                "`streamer` cannot be used with beam search (yet!). Make sure that `num_beams` is set to 1."
+            )
+
+        if self.device.type != input_ids.device.type:
+            warnings.warn(
+                "You are calling .generate() with the `input_ids` being on a device type different"
+                f" than your model's device. `input_ids` is on {input_ids.device.type}, whereas the model"
+                f" is on {self.device.type}. You may experience unexpected behaviors or slower generation."
+                " Please make sure that you have put `input_ids` to the"
+                f" correct device by calling for example input_ids = input_ids.to('{self.device.type}') before"
+                " running `.generate()`.",
+                UserWarning,
+            )
+
+        # 8. prepare distribution pre_processing samplers
+        prepared_logits_processor = self._get_logits_processor(
+            generation_config=generation_config,
+            input_ids_seq_length=input_ids_length,
+            encoder_input_ids=inputs_tensor,
+            prefix_allowed_tokens_fn=prefix_allowed_tokens_fn,
+            logits_processor=logits_processor,
+            device=inputs_tensor.device,
+            model_kwargs=model_kwargs,
+            negative_prompt_ids=negative_prompt_ids,
+            negative_prompt_attention_mask=negative_prompt_attention_mask,
+        )
+
+        # 9. prepare stopping criteria
+        prepared_stopping_criteria = self._get_stopping_criteria(
+            generation_config=generation_config, stopping_criteria=stopping_criteria, tokenizer=tokenizer, **kwargs
+        )
+
+        # 10. go into different generation modes
+        if generation_mode in (GenerationMode.SAMPLE, GenerationMode.GREEDY_SEARCH):
+            # 11. prepare logits warper
+            prepared_logits_warper = (
+                self._get_logits_warper(generation_config, device=input_ids.device)
+                if generation_config.do_sample
+                else None
+            )
+
+            # 12. expand input_ids with `num_return_sequences` additional sequences per batch
+            input_ids, model_kwargs = self._expand_inputs_for_generation(
+                input_ids=input_ids,
+                expand_size=generation_config.num_return_sequences,
+                is_encoder_decoder=self.config.is_encoder_decoder,
+                **model_kwargs,
+            )
+
+            # 13. run sample (it degenerates to greedy search when `generation_config.do_sample=False`)
+            result = self._sample(
+                input_ids,
+                logits_processor=prepared_logits_processor,
+                logits_warper=prepared_logits_warper,
+                stopping_criteria=prepared_stopping_criteria,
+                generation_config=generation_config,
+                synced_gpus=synced_gpus,
+                streamer=streamer,
+                use_aux_states=use_aux_states,
+                aux_states=aux_states,
+                **model_kwargs,
+            )
+
+        # Convert to legacy cache if needed
+        if use_dynamic_cache_by_default and generation_config.return_legacy_cache:
+            if isinstance(result, ModelOutput) and hasattr(result, "past_key_values"):
+                if isinstance(result.past_key_values, (DynamicCache, EncoderDecoderCache)):
+                    result.past_key_values = result.past_key_values.to_legacy_cache()
+        return result

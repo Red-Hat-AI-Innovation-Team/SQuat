@@ -1,15 +1,12 @@
-# LLaMA model with KIVI
 import warnings
 warnings.filterwarnings("ignore")
 import torch
 import random
-from models.llama_kivi import LlamaForCausalLM_KIVI
-from transformers import LlamaConfig, AutoTokenizer
+from transformers import AutoTokenizer
 from datasets import load_dataset
 import argparse
 from matheval import math_equal, memoized_canonical_form, extract
 import os
-from transformers.generation import GenerationMixin
 
 system_prompts = {
     'math500': (
@@ -41,18 +38,18 @@ def main():
     # torch.backends.cudnn.deterministic = True
     # torch.backends.cudnn.benchmark = False
 
-    parser = argparse.ArgumentParser(description='LLaMA model with KIVI')
+    parser = argparse.ArgumentParser(description='LLaMA model with SQuat')
     parser.add_argument('--dataset', type=str, default='math500', help='Dataset to use')
     parser.add_argument('--template', type=str, default='math500', help='Template to use')
-    parser.add_argument('--k_bits', type=int, default=2, help='KiVi K bits (2 or 4)')
-    parser.add_argument('--v_bits', type=int, default=2, help='KiVi V bits (2 or 4)') 
+    parser.add_argument('--k_bits', type=int, default=2, help='K bits (2 or 4)')
+    parser.add_argument('--v_bits', type=int, default=2, help='V bits (2 or 4)') 
     parser.add_argument('--group_size', type=int, default=32, help='Group size for quantization')
     parser.add_argument('--residual_length', type=int, default=32, help='Number of recent fp16 tokens')
     parser.add_argument('--residual_length_prefill', type=int, default=32, help='Number of recent fp16 tokens')
     parser.add_argument('--model_path', type=str, default='meta-llama/Llama-3.1-8B-Instruct', help='Path to pretrained model')
     parser.add_argument('--prompt', type=str, default="Repeat the following sentence: 'The capital of California is Beijing.'", help='Input prompt')
     parser.add_argument('--max_new_tokens', type=int, default=1024, help='Maximum number of new tokens to generate')
-    parser.add_argument('--method', type=str, default='kivi', help='Method to use')
+    parser.add_argument('--method', type=str, default='squat_pre', help='Method to use')
     parser.add_argument('--num_samples', type=int, default=100, help='Number of samples to generate')
     parser.add_argument('--subspace_dim', type=int, default=20, help='Subspace dimension')
     parser.add_argument('--squat_lambda', type=float, default=0.1, help='Lambda for Lagrangian')
@@ -72,8 +69,10 @@ def main():
     args = parser.parse_args()
 
     if "mistral" in args.model_path.lower():
+        from transformers import MistralConfig
         config = MistralConfig.from_pretrained(args.model_path)
     else:
+        from transformers import LlamaConfig
         config = LlamaConfig.from_pretrained(args.model_path)
     config.shared_svd = args.shared_svd
     config.k_bits = args.k_bits
@@ -161,10 +160,6 @@ def main():
         padding_side=args.padding_side,
         trust_remote_code=True)
 
-    empty_messages = [{'role': 'system', 'content': system_prompts[args.template]}, 
-                            {'role': 'user', 'content': ''}]
-    template_len = len(tokenizer(tokenizer.apply_chat_template(empty_messages, tokenize=False).replace("Cutting Knowledge Date: December 2023\nToday Date: 26 Jul 2024\n\n", ""))['input_ids'])
-    
     # if index file exists, read the indices from the file
     if os.path.exists(args.index_file):
         with open(args.index_file, "r") as f:
