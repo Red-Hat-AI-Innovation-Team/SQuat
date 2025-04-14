@@ -8,6 +8,7 @@ import argparse
 from matheval import math_equal, memoized_canonical_form, extract
 import os
 
+
 system_prompts = {
     'math500': (
         "Solve the following math problem efficiently and clearly:\n\n"
@@ -28,6 +29,18 @@ system_prompts = {
         r"Please reason step by step, and put your final answer within \boxed{}."
     )
 }
+
+def create_qual_data():
+    quality_ds = load_dataset('emozilla/quality', split='train')
+    quality_ds = quality_ds.map(lambda x: {'choices': '\n'.join([f"{i+1}. {choice}" for i, choice in enumerate(x['options'])])})
+
+    ds_ = quality_ds.map(lambda x: {'messages': [
+        {'role': 'user', 'content': f"### Context: \n{x['article']}\n### Question\n{x['question']}\nChoices:{x['choices']}"},
+        {'role': 'assistant', 'content': f"{x['answer']}"}
+        ]})
+    #ds_.to_json("<your path>.jsonl", orient='records', lines=True)
+    return ds_
+
 
 @torch.no_grad()
 def main():
@@ -66,6 +79,7 @@ def main():
     parser.add_argument("--save_config_path", type=str, default="config.json")
     parser.add_argument("--force_use_flash", action="store_true")
     parser.add_argument("--cuda_bmm_implementation", type=str, default="cos_sin", help='Cuda BMM implementation')
+    parser.add_argument("--dataset_svd", type=str, default="gsm8k", help='Dataset for SVD')
     args = parser.parse_args()
 
     if "mistral" in args.model_path.lower():
@@ -161,11 +175,20 @@ def main():
         trust_remote_code=True)
     
     # Compute Q subspace offline
-    dataset = load_dataset('gsm8k', 'main')
-    prompt = ''
-    for i in range(5):
-        prompt += 'Question: ' + dataset['train'][i]['question'] + '\nAnswer: ' + dataset['train'][i]['answer'] + '\n'
-    prompt += "Question: John takes care of 10 dogs. Each dog takes .5 hours a day to walk and take care of their business. How many hours a week does he spend taking care of dogs?"
+    if args.dataset_svd == 'gsm8k':
+        dataset = load_dataset('gsm8k', 'main')
+        prompt = ''
+        for i in range(5):
+            prompt += 'Question: ' + dataset['train'][i]['question'] + '\nAnswer: ' + dataset['train'][i]['answer'] + '\n'
+        prompt += "Question: John takes care of 10 dogs. Each dog takes .5 hours a day to walk and take care of their business. How many hours a week does he spend taking care of dogs?"
+    elif args.dataset_svd == 'quality':
+        dataset = create_qual_data()
+        prompt = ''
+        for i in range(1):
+            prompt += tokenizer.apply_chat_template(dataset[i]["messages"][:1], tokenize=False, add_generation_prompt=True)
+    else:
+        raise NotImplementedError(f"Dataset {args.dataset_svd} not implemented")
+    
     inputs = tokenizer(prompt, return_tensors="pt").input_ids.to('cuda')
     AP_states = {layer_idx: [] for layer_idx in range(32)}
     _ = model.save_auxiliary_states(
