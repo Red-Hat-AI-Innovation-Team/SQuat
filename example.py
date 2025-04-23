@@ -4,7 +4,6 @@ import torch
 import random
 from transformers import LlamaConfig, MistralConfig, AutoTokenizer
 from datasets import load_dataset
-
 import argparse
 
 """ modified from kivi example.py
@@ -24,7 +23,7 @@ def main():
     parser.add_argument('--residual_length', type=int, default=32, help='Number of recent fp16 tokens')
     parser.add_argument('--model_path', type=str, default='meta-llama/Llama-3.1-8B-Instruct', help='Path to pretrained model')
     parser.add_argument('--prompt', type=str, default="Repeat the following sentence: 'The capital of California is Beijing.'", help='Input prompt')
-    parser.add_argument('--max_new_tokens', type=int, default=96, help='Maximum number of new tokens to generate')
+    parser.add_argument('--max_new_tokens', type=int, default=128, help='Maximum number of new tokens to generate')
     parser.add_argument('--method', type=str, default='squat', help='Method to use')
     parser.add_argument('--subspace_dim', type=int, default=20, help='Subspace dimension')
     parser.add_argument('--squat_lambda', type=float, default=0.001, help='Lambda for Lagrangian')
@@ -37,6 +36,9 @@ def main():
     parser.add_argument("--squat_query_subspace_prerope", type=str, default="after")
     parser.add_argument("--power_method", action="store_true")
     parser.add_argument("--cuda_bmm_implementation", type=str, default="cos_sin")
+    parser.add_argument("--key_quant", type=str, default='per_channel', choices=['per_channel', 'per_token'])
+    parser.add_argument("--no_hadamard", action="store_true")
+    parser.add_argument("--strict_no_residual", action="store_true")
     args = parser.parse_args()
 
     if "mistral" in args.model_path.lower():
@@ -59,7 +61,9 @@ def main():
     config.squat_query_subspace_prerope = args.squat_query_subspace_prerope
     config.force_use_flash = args.force_use_flash
     config.cuda_bmm_implementation = args.cuda_bmm_implementation
-    
+    config.key_quant = args.key_quant
+    config.no_hadamard = args.no_hadamard
+    config.strict_no_residual = args.strict_no_residual
     if "mistral" in args.model_path.lower():
         if "kivi" in args.method:
             from models.mistral_kivi import MistralForCausalLM_KIVI
@@ -114,6 +118,11 @@ def main():
             ).cuda()
         else:
             raise NotImplementedError(f"Method {args.method} not implemented")
+    
+    if not args.no_hadamard:
+        from rotation_utils import rotate_model_v
+        rotate_model_v(model, config)
+        print("Rotated model")
 
     enc = AutoTokenizer.from_pretrained(
         args.model_path, 
@@ -128,15 +137,12 @@ def main():
     prompt += "Question: John takes care of 10 dogs. Each dog takes .5 hours a day to walk and take care of their business. How many hours a week does he spend taking care of dogs?"
     inputs = enc(prompt, return_tensors="pt").input_ids.to('cuda')
 
-    At_states = {layer_idx: [] for layer_idx in range(32)}
-    At_states[0] = 1
-
     output = model.generate(
         inputs, 
         max_new_tokens=args.max_new_tokens,
         do_sample=False,
         use_cache=True,
-        )
+    )
     print(enc.decode(output[0].tolist()[inputs.shape[1]:], skip_special_tokens=True))
 
 if __name__ == "__main__":

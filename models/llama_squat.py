@@ -30,6 +30,8 @@ from transformers.utils import ModelOutput
 from transformers.cache_utils import DynamicCache, EncoderDecoderCache
 import inspect
 
+from fast_hadamard_transform import hadamard_transform
+
 _CONFIG_FOR_DOC = "LlamaConfig"
 
 
@@ -59,6 +61,7 @@ class LlamaFlashAttention_SQuat(nn.Module):
         self.v_bits = config.v_bits
         self.group_size = config.group_size
         self.residual_length = config.residual_length
+        self.key_quant = getattr(self.config, "key_quant", 'per_channel')
 
         if (self.head_dim * self.num_heads) != self.hidden_size:
             raise ValueError(
@@ -144,14 +147,21 @@ class LlamaFlashAttention_SQuat(nn.Module):
 
             cos, sin = self.rotary_emb(value_states, position_ids)
             query_states = apply_rotary_pos_emb_1(query_states, cos, sin, position_ids) # !!!
-
+            # if self.key_quant == 'per_token' and not getattr(self.config, "no_hadamard", False):
+            #     query_states = hadamard_transform(query_states.float(), scale=1/math.sqrt(query_states.shape[-1])).to(query_states.dtype)
+            
             if key_states_quant_trans is not None:
                 #=========================================================
-                key_states_length = key_states_quant_trans.shape[-1] * feat_per_int
+                key_states_length = key_states_quant_trans.shape[-1] * (feat_per_int if self.key_quant == 'per_channel' else 1)
                 position_ids_quant = position_ids_past[:,:key_states_length]
                 cos, sin = self.rotary_emb(value_states, position_ids_quant)
-                att_qkquant = self.cuda_bmm_fA_qB_outer(self.group_size, query_states, key_states_quant_trans, 
-                                                           key_scale_trans, key_mn_trans, cos, sin, self.k_bits)
+                if self.key_quant == 'per_channel':
+                    att_qkquant = self.cuda_bmm_fA_qB_outer(self.group_size, query_states, key_states_quant_trans, 
+                                                            key_scale_trans, key_mn_trans, cos, sin, self.k_bits)
+                else:
+                    key_states_dequant = unpack_and_dequant_along_last_dim(key_states_quant_trans.transpose(2, 3), key_scale_trans.transpose(2, 3), key_mn_trans.transpose(2, 3), self.group_size, self.k_bits)
+                    key_states_dequant_rot = apply_rotary_pos_emb_1(key_states_dequant, cos, sin, position_ids_quant)
+                    att_qkquant = torch.matmul(query_states, repeat_kv(key_states_dequant_rot, self.num_key_value_groups).transpose(2, 3))
                 #=========================================================
             else:
                 att_qkquant = None
@@ -176,7 +186,7 @@ class LlamaFlashAttention_SQuat(nn.Module):
             if key_states_full.shape[-2] == self.residual_length:
                 assert self.residual_length % self.group_size == 0
                 # =========================================================
-                key_states_quant_trans_new, key_scale_trans_new, key_mn_trans_new = squat_lagrangian(key_states_full.transpose(2, 3).contiguous(), self.config.quant_group_size, self.group_size, self.k_bits, Ainv_t, P_inv)
+                key_states_quant_trans_new, key_scale_trans_new, key_mn_trans_new = squat_lagrangian(key_states_full.transpose(2, 3).contiguous(), self.config.quant_group_size, self.group_size, self.k_bits, Ainv_t, P_inv, key_quant=self.key_quant)
                 # =========================================================
                 key_states_full = None
                 if key_states_quant_trans is not None:
@@ -359,7 +369,7 @@ class LlamaFlashAttention_SQuat(nn.Module):
                     key_states_quant_fixed = torch.where(attn_mask[:,:,1:].unsqueeze(-1), key_states_quant, key_states_quant_first_col)
                 else:
                     key_states_quant_fixed = key_states_quant
-                key_states_quant_trans, key_scale_trans, key_mn_trans = squat_lagrangian(key_states_quant_fixed.transpose(2, 3).contiguous(), self.config.quant_group_size, self.group_size, self.k_bits, Ainv_t, P_inv)
+                key_states_quant_trans, key_scale_trans, key_mn_trans = squat_lagrangian(key_states_quant_fixed.transpose(2, 3).contiguous(), self.config.quant_group_size, self.group_size, self.k_bits, Ainv_t, P_inv, key_quant=self.key_quant)
 
             else:
                 key_states_quant_trans = None
@@ -570,6 +580,11 @@ class LlamaFlashAttention_SQuat_postrope(LlamaFlashAttention_SQuat):
             kv_seq_len += past_key_value[-1]  #!!!
         cos, sin = self.rotary_emb(value_states, position_ids)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        #######
+        if self.key_quant == 'per_token' and not getattr(self.config, "no_hadamard", False):
+            dtype = query_states.dtype
+            query_states = hadamard_transform(query_states.float(), scale=1/math.sqrt(query_states.shape[-1])).to(dtype)
+            key_states = hadamard_transform(key_states.float(), scale=1/math.sqrt(key_states.shape[-1])).to(dtype)
 
         # assert self.num_key_value_groups == 1
         # [bsz, nh, t, hd]
@@ -592,8 +607,12 @@ class LlamaFlashAttention_SQuat_postrope(LlamaFlashAttention_SQuat):
             else:
                 att_qkpre = None
             if key_states_quant_trans is not None:
-                att_qkquant = cuda_bmm_fA_qB_outer(self.group_size, query_states, key_states_quant_trans, 
-                                key_scale_trans, key_mn_trans, self.k_bits)
+                if self.key_quant == 'per_channel':
+                    att_qkquant = cuda_bmm_fA_qB_outer(self.group_size, query_states, key_states_quant_trans, 
+                                    key_scale_trans, key_mn_trans, self.k_bits)
+                else:
+                    key_states_dequant = unpack_and_dequant_along_last_dim(key_states_quant_trans.transpose(2, 3), key_scale_trans.transpose(2, 3), key_mn_trans.transpose(2, 3), self.group_size, self.k_bits)
+                    att_qkquant = torch.matmul(query_states, repeat_kv(key_states_dequant, self.num_key_value_groups).transpose(2, 3))
             else:
                 att_qkquant = None
             if key_states_full is not None:
@@ -610,9 +629,9 @@ class LlamaFlashAttention_SQuat_postrope(LlamaFlashAttention_SQuat):
             attn_weights = torch.cat([attn_weights, att_qkfull], dim=-1) / math.sqrt(self.head_dim)
 
             if key_states_full.shape[-2] == self.residual_length:
-                assert self.residual_length % self.group_size == 0
+                assert self.key_quant == "per_token" or (self.residual_length % self.group_size == 0)
                 # =========================================================
-                key_states_quant_trans_new, key_scale_trans_new, key_mn_trans_new = squat_lagrangian(key_states_full.transpose(2, 3).contiguous(), self.config.quant_group_size, self.group_size, self.k_bits, Ainv_t, P_inv)
+                key_states_quant_trans_new, key_scale_trans_new, key_mn_trans_new = squat_lagrangian(key_states_full.transpose(2, 3).contiguous(), self.config.quant_group_size, self.group_size, self.k_bits, Ainv_t, P_inv, key_quant=self.key_quant)
                 # =========================================================
                 key_states_full = None
                 if key_states_quant_trans is not None:
@@ -649,7 +668,7 @@ class LlamaFlashAttention_SQuat_postrope(LlamaFlashAttention_SQuat):
             else:
                 value_pre_length = 0
                 attn_output = 0.
-            if value_states_full is not None:
+            if value_states_full is not None: # NOTE: true when prefilling with no quantization, OR strict_no_residual
                 value_states_full = torch.cat([value_states_full, value_states], dim=2)
             else:
                 value_states_full = value_states
@@ -657,15 +676,13 @@ class LlamaFlashAttention_SQuat_postrope(LlamaFlashAttention_SQuat):
             if value_states_quant is None:
                 attn_output += torch.matmul(attn_weights[:, :, :, value_pre_length:], repeat_kv(value_states_full, self.num_key_value_groups))
             else:
-                attn_output += cuda_bmm_fA_qB_outer(self.group_size, attn_weights[:, :, :, value_pre_length:-value_full_length], value_states_quant, 
-                                                value_scale, value_mn, self.v_bits)
+                attn_output += cuda_bmm_fA_qB_outer(
+                    self.group_size, attn_weights[:, :, :, value_pre_length:-value_full_length], value_states_quant, value_scale, value_mn, self.v_bits)
                 attn_output += torch.matmul(attn_weights[:, :, :, -value_full_length:], repeat_kv(value_states_full, self.num_key_value_groups))
             attn_output = attn_output.transpose(1, 2).contiguous()
             if value_full_length > self.residual_length:
                 assert value_full_length == self.residual_length + 1
-                value_states_quant_new, scale, mn = triton_quantize_and_pack_along_last_dim(value_states_full[:, :, :1, :].contiguous(), 
-                                                                                                self.group_size, 
-                                                                                                self.v_bits)
+                value_states_quant_new, scale, mn = triton_quantize_and_pack_along_last_dim(value_states_full[:, :, :1, :].contiguous(), self.group_size, self.v_bits)
                 value_states_full = value_states_full[:, :, 1:, :].contiguous()
                 if value_states_quant is not None:
                     value_states_quant = torch.cat([value_states_quant, value_states_quant_new], dim=2)
@@ -675,8 +692,20 @@ class LlamaFlashAttention_SQuat_postrope(LlamaFlashAttention_SQuat):
                     value_states_quant = value_states_quant_new
                     value_scale = scale
                     value_mn = mn
+            else: # NOTE: strict_no_residual
+                assert value_full_length == self.residual_length
+                value_states_quant_new, scale, mn = triton_quantize_and_pack_along_last_dim(value_states_full, self.group_size, self.v_bits)
+                value_states_full = None
+                if value_states_quant is not None:
+                    value_states_quant = torch.cat([value_states_quant, value_states_quant_new], dim=2)
+                    value_scale = torch.cat([value_scale, scale], dim=2)
+                    value_mn = torch.cat([value_mn, mn], dim=2)
+                else:
+                    value_states_quant = value_states_quant_new
+                    value_scale = scale
+                    value_mn = mn
 
-        else:
+        else: # NOTE: prefilling
             residual_length = self.config.residual_length
             input_dtype = query_states.dtype
             if input_dtype == torch.float32:
@@ -799,7 +828,7 @@ class LlamaFlashAttention_SQuat_postrope(LlamaFlashAttention_SQuat):
                     key_states_quant_fixed = torch.where(attn_mask[:,:,1:].unsqueeze(-1), key_states_quant, key_states_quant_first_col)
                 else:
                     key_states_quant_fixed = key_states_quant
-                key_states_quant_trans, key_scale_trans, key_mn_trans = squat_lagrangian(key_states_quant_fixed.transpose(2, 3).contiguous(), self.config.quant_group_size, self.group_size, self.k_bits, Ainv_t, P_inv)
+                key_states_quant_trans, key_scale_trans, key_mn_trans = squat_lagrangian(key_states_quant_fixed.transpose(2, 3).contiguous(), self.config.quant_group_size, self.group_size, self.k_bits, Ainv_t, P_inv, key_quant=self.key_quant)
             else:
                 key_states_quant_trans = None
                 key_scale_trans = None
@@ -811,11 +840,13 @@ class LlamaFlashAttention_SQuat_postrope(LlamaFlashAttention_SQuat):
                 value_scale = None
                 value_mn = None
             else:
-                value_states_quant = value_states[:, :, :-residual_length, :].contiguous()
-                value_states_full = value_states[:, :, -residual_length:, :].contiguous()
-                value_states_quant, value_scale, value_mn = triton_quantize_and_pack_along_last_dim(value_states_quant, 
-                                                                                                self.group_size, 
-                                                                                                self.v_bits)
+                if self.residual_length == 1 and getattr(self.config, "strict_no_residual", False):
+                    value_states_quant = value_states
+                    value_states_full = None
+                else:
+                    value_states_quant = value_states[:, :, :-residual_length, :].contiguous()
+                    value_states_full = value_states[:, :, -residual_length:, :].contiguous()
+                value_states_quant, value_scale, value_mn = triton_quantize_and_pack_along_last_dim(value_states_quant, self.group_size, self.v_bits)
             
             key_states_pre = None
             value_states_pre = None

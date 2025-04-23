@@ -217,20 +217,20 @@ def triton_quantize_and_pack_along_last_dim(
     mn = torch.empty((B * nh * D, num_groups), device=data.device, dtype=data.dtype)
     BLOCK_SIZE_N = 128
     grid = lambda meta: (triton.cdiv(data.shape[0] * data.shape[1], BLOCK_SIZE_N),)
-    with torch.cuda.device(data.device):
-        _minmax_along_last_dim[grid](
-            data,
-            mn,
-            mx,
-            data.numel(),
-            data.shape[0],
-            num_groups,
-            group_size,
-            BLOCK_SIZE_N=BLOCK_SIZE_N,
-            num_warps=8,
-        )
-    # mn = torch.min(data, dim=-1, keepdim=True)[0].squeeze(-1)
-    # mx = torch.max(data, dim=-1, keepdim=True)[0].squeeze(-1)
+    # with torch.cuda.device(data.device):
+    #     _minmax_along_last_dim[grid](
+    #         data,
+    #         mn,
+    #         mx,
+    #         data.numel(),
+    #         data.shape[0],
+    #         num_groups,
+    #         group_size,
+    #         BLOCK_SIZE_N=BLOCK_SIZE_N,
+    #         num_warps=8,
+    #     )  # NOTE: this causes issue when residual length is 1
+    mn = torch.min(data, dim=-1, keepdim=True)[0].squeeze(-1)
+    mx = torch.max(data, dim=-1, keepdim=True)[0].squeeze(-1)
     scale = (mx - mn) / (2**bit - 1)
     data = data - mn.unsqueeze(-1)
     data.div_(scale.unsqueeze(-1))
@@ -279,11 +279,11 @@ def triton_quantize_and_pack_along_last_dim_with_dequant(data: torch.Tensor, gro
     mn = torch.empty((B * nh * D, num_groups), device=data.device, dtype=data.dtype)
     BLOCK_SIZE_N = 128
     grid = lambda meta: (triton.cdiv(data.shape[0]*data.shape[1], BLOCK_SIZE_N),)
-    _minmax_along_last_dim[grid](data, mn, mx,
-                             data.numel(), data.shape[0], num_groups, group_size,
-                             BLOCK_SIZE_N=BLOCK_SIZE_N, num_warps=8) 
-    # mn = torch.min(data, dim=-1, keepdim=True)[0].squeeze(-1)
-    # mx = torch.max(data, dim=-1, keepdim=True)[0].squeeze(-1)
+    # _minmax_along_last_dim[grid](data, mn, mx,
+    #                          data.numel(), data.shape[0], num_groups, group_size,
+    #                          BLOCK_SIZE_N=BLOCK_SIZE_N, num_warps=8) 
+    mn = torch.min(data, dim=-1, keepdim=True)[0].squeeze(-1)
+    mx = torch.max(data, dim=-1, keepdim=True)[0].squeeze(-1)
     scale = (mx - mn) / (2 ** bit - 1)
     quant_data = data - mn.unsqueeze(-1)
     quant_data.div_(scale.unsqueeze(-1))
@@ -323,6 +323,44 @@ def unpack_and_dequant_along_last_dim(
     data = data.to(torch.float16)
     data = data * scale.unsqueeze(-1) + mn.unsqueeze(-1)
     return data.view(shape)
+
+
+def triton_quantize_and_pack(data: torch.Tensor, group_size: int, bit: int, dim: int = -1):
+    assert len(data.shape) == 4
+    if dim == -1 or dim == 3:
+        return triton_quantize_and_pack_along_last_dim(data, group_size, bit)
+    elif dim == -2 or dim == 2:
+        data_quant, scale, mn = triton_quantize_and_pack_along_last_dim(data.transpose(2, 3).contiguous(), group_size, bit)
+        return data_quant.transpose(2, 3), scale.transpose(2, 3), mn.transpose(2, 3)
+    else:
+        raise ValueError(f"Invalid dimension: {dim}")
+
+
+def triton_quantize_and_pack_with_dequant(data: torch.Tensor, group_size: int, bit: int, dim: int = -1):
+    assert len(data.shape) == 4
+    if dim == -1 or dim == 3:
+        return triton_quantize_and_pack_along_last_dim_with_dequant(data, group_size, bit)
+    elif dim == -2 or dim == 2:
+        data_quant, scale, mn, dequant = triton_quantize_and_pack_along_last_dim_with_dequant(data.transpose(2, 3).contiguous(), group_size, bit)
+        return data_quant.transpose(2, 3), scale.transpose(2, 3), mn.transpose(2, 3), dequant.transpose(2, 3)
+    else:
+        raise ValueError(f"Invalid dimension: {dim}")
+
+
+def unpack_and_dequant(
+    v_code: torch.FloatTensor,
+    scale: torch.FloatTensor,
+    mn: torch.FloatTensor,
+    group_size: int,
+    bits: int,
+    dim: int = -1,
+):
+    if dim == -1 or dim == 3:
+        return unpack_and_dequant_along_last_dim(v_code, scale, mn, group_size, bits)
+    elif dim == -2 or dim == 2:
+        return unpack_and_dequant_along_last_dim(v_code.transpose(2, 3), scale.transpose(2, 3), mn.transpose(2, 3), group_size, bits).transpose(2, 3)
+    else:
+        raise ValueError(f"Invalid dimension: {dim}")
 
 
 def generate_At_inv(quant_group_size, my_Qhat, lamb=1, tol=1e-7):
@@ -373,24 +411,36 @@ def generate_At_inv(quant_group_size, my_Qhat, lamb=1, tol=1e-7):
 
 
 def squat_lagrangian(
-    key_states_full_trans, quant_group_size, seq_group_size, k_bits, Ainv_t, P_inv
+    key_states_full_trans, quant_group_size, seq_group_size, k_bits, Ainv_t, P_inv, key_quant='per_channel'
 ):
     # key_states_full_trans: [b, nh/4, d, t]
     # group_size: 32
     # k_bits: 2, 4
-    key_states_quant_trans, key_scale_trans, key_mn_trans = new_quant(
-        key_states_full_trans.transpose(2, 3),
-        quant_group_size,
-        seq_group_size,
-        k_bits,
-        Ainv_t,
-        P_inv,
-    )
+    if key_quant == 'per_channel':
+        key_states_quant_trans, key_scale_trans, key_mn_trans = new_quant(
+            key_states_full_trans.transpose(2, 3),
+            quant_group_size,
+            seq_group_size,
+            k_bits,
+            Ainv_t,
+            P_inv,
+        )
+    elif key_quant == 'per_token':
+        key_states_quant_trans, key_scale_trans, key_mn_trans = new_quant_along_last_dim(
+            key_states_full_trans.transpose(2, 3),
+            quant_group_size,
+            seq_group_size,
+            k_bits,
+            Ainv_t,
+            P_inv,
+        )
+    else:
+        raise ValueError(f"Invalid key_quant: {key_quant}")
     return key_states_quant_trans, key_scale_trans, key_mn_trans
 
 
 def new_quant(key_states, quant_group_size, seq_group_size, k_bits, Ainv_t, P_inv):
-    # TODO: give ht instead of Ainv_t as input
+    # NOTE: SQuat quantization along second last dimension
 
     dtype = key_states.dtype
     # P_inv = torch.inverse(Ainv_t[-1])
@@ -439,6 +489,56 @@ def new_quant(key_states, quant_group_size, seq_group_size, k_bits, Ainv_t, P_in
     key_states_quant_trans = torch.cat(key_states_quant_trans, dim=2)
     key_scale_trans = torch.cat(key_scale_trans, dim=2)
     key_mn_trans = torch.cat(key_mn_trans, dim=2)
+
+    return key_states_quant_trans, key_scale_trans, key_mn_trans
+
+
+def new_quant_along_last_dim(key_states, quant_group_size, seq_group_size, k_bits, Ainv_t, P_inv):
+    # NOTE: SQuat quantization along last dimension
+
+    # dtype = key_states.dtype
+
+    bsz, nh, seq_len, hidden_dim = key_states.shape
+
+    # hidden_dim needs to be divisible by quant_group_size
+    T = (hidden_dim+quant_group_size-1)//quant_group_size
+
+    key_states_quant_trans, key_scale_trans, key_mn_trans = [], [], []
+    
+    group = key_states  # Extract the group
+
+    for i in range(T):
+
+        key_states_quant_this_quant_group, key_scale_this_quant_group, key_mn_this_quant_group, dequantized = triton_quantize_and_pack_along_last_dim_with_dequant(group[:, :, :, i * quant_group_size : (i + 1) * quant_group_size], seq_group_size, k_bits)
+        # if group.shape[-2] == 1:
+        #     breakpoint()
+        if i < T - 1:
+            d_vec = (
+                dequantized
+                - group[:, :, :, i * quant_group_size : (i + 1) * quant_group_size]
+            ).float()
+            H_t = Ainv_t[i]
+
+            # H_t = H_t[:, :, :, -quant_group_size:]
+            B_t = P_inv[
+                :, :, (i + 1) * quant_group_size :, : (i + 1) * quant_group_size
+            ]
+
+            update = torch.matmul(
+                torch.matmul(d_vec, H_t.transpose(-2, -1)), B_t.transpose(-2, -1)
+            )
+
+            group[:, :, :, (i + 1) * quant_group_size :] = (
+                group[:, :, :, (i + 1) * quant_group_size :] + update
+            )
+        
+        key_states_quant_trans.append(key_states_quant_this_quant_group)
+        key_scale_trans.append(key_scale_this_quant_group)
+        key_mn_trans.append(key_mn_this_quant_group)
+
+    key_states_quant_trans = torch.cat(key_states_quant_trans, dim=3).transpose(2, 3)
+    key_scale_trans = torch.cat(key_scale_trans, dim=3).transpose(2, 3)
+    key_mn_trans = torch.cat(key_mn_trans, dim=3).transpose(2, 3)
 
     return key_states_quant_trans, key_scale_trans, key_mn_trans
 
